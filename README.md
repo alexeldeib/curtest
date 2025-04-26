@@ -42,6 +42,8 @@ You can also specify a service tag for peer discovery (default is "fastreg"):
 - No central registry required
 - Automatic peer discovery within the same network
 - Service-based node grouping
+- Distributed key-value storage and retrieval
+- Mesh network formation independent of bootstrap nodes
 
 ## Example Usage
 
@@ -58,3 +60,17 @@ You can also specify a service tag for peer discovery (default is "fastreg"):
    ```
 
 Nodes will automatically discover each other through the DHT, even if they're not directly connected to the bootstrap node.
+
+## Key-Value Storage and Retrieval
+
+FastReg allows storing and retrieving values in the distributed hash table, making it useful for service discovery and configuration sharing:
+
+```go
+// Store a value
+err := node.PutValue(ctx, "/fastreg/mykey", []byte("myvalue"))
+
+// Retrieve a value (can be from any node in the network)
+value, err := node.GetValue(ctx, "/fastreg/mykey")
+```
+
+Values stored in the DHT are replicated across multiple nodes for redundancy and can be retrieved from any node in the network, even if the original node that stored the value is offline.
