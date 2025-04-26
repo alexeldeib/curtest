@@ -62,8 +62,11 @@ func TestRegistryMirror(t *testing.T) {
 	node1.AdvertiseAndFindPeers(ctx, "registry-test")
 	node2.AdvertiseAndFindPeers(ctx, "registry-test")
 
-	// Allow time for DHT connections to establish
-	time.Sleep(2 * time.Second)
+	// Wait for DHT nodes to connect to each other
+	err = WaitForDHTConnectivity(ctx, node1, node2, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Nodes failed to connect: %v", err)
+	}
 
 	// Create a mock HTTP server for the "upstream" registry
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -253,6 +256,10 @@ func testFallbackToUpstream(t *testing.T, server *httptest.Server) {
 
 // Test case 2: Verify P2P distribution between nodes
 func testP2PDistribution(t *testing.T, server1, server2 *httptest.Server, registry1, registry2 *Registry) {
+	// Create a context for this test
+	testCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
 	// Create a unique test blob with a real digest
 	testContent := []byte("This is test content for P2P distribution between DHT nodes")
 	dgst := digest.FromBytes(testContent)
@@ -264,13 +271,17 @@ func testP2PDistribution(t *testing.T, server1, server2 *httptest.Server, regist
 	}
 
 	// Advertise the content in the DHT
-	err = registry1.StoreInDHT(context.Background(), dgst)
+	err = registry1.StoreInDHT(testCtx, dgst)
 	if err != nil {
 		t.Fatalf("Failed to advertise blob in DHT: %v", err)
 	}
 
-	// Give time for DHT propagation
-	time.Sleep(2 * time.Second)
+	// Wait for the content to be available in the DHT
+	// Use a simple delay instead of waiting for the value due to test structure
+	err = ForDuration(testCtx, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Wait interrupted: %v", err)
+	}
 
 	// Now try to fetch the content from the second registry
 	url := fmt.Sprintf("%s/v2/test/p2p/blobs/%s", server2.URL, dgst.String())
@@ -311,6 +322,10 @@ func testP2PDistribution(t *testing.T, server1, server2 *httptest.Server, regist
 
 // Test case 3: Push and pull through P2P nodes
 func testPushToP2PNode(t *testing.T, server1, server2 *httptest.Server) {
+	// Create a context for this test
+	testCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
 	// Create test content
 	testContent := []byte("This is test content for pushing to a P2P node")
 	dgst := digest.FromBytes(testContent)
@@ -337,8 +352,11 @@ func testPushToP2PNode(t *testing.T, server1, server2 *httptest.Server) {
 	// but for testing P2P, we can use StoreBlobLocally directly
 	// and then pull from the other node
 
-	// Give time for DHT updates
-	time.Sleep(2 * time.Second)
+	// Wait for DHT propagation with a simple delay since this is a simpler test case
+	err = ForDuration(testCtx, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Wait interrupted: %v", err)
+	}
 
 	// Pull the content from the second registry
 	pullURL := fmt.Sprintf("%s/v2/test/push/blobs/%s", server2.URL, dgst.String())
@@ -404,8 +422,12 @@ func testRealDockerImage(t *testing.T, registry1, registry2 *Registry) {
 		t.Fatalf("Failed to advertise Ubuntu layer in DHT: %v", err)
 	}
 
-	// Give DHT time to propagate
-	time.Sleep(3 * time.Second)
+	// Wait for the blob to be available using a simple delay
+	// since we can't directly access the DHT in this test
+	err = ForDuration(ctx, 3*time.Second) 
+	if err != nil {
+		t.Fatalf("Wait interrupted: %v", err)
+	}
 
 	// Step 2: Now try to fetch the same layer using the second registry
 	// This should use the P2P connection rather than going to Docker Hub

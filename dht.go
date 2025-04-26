@@ -32,6 +32,7 @@ type DHT struct {
 	host   host.Host
 	kadDHT *dht.IpfsDHT
 	mu     sync.Mutex
+	// expose the underlying DHT for test utility functions
 }
 
 // NewDHT creates a new DHT instance
