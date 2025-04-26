@@ -44,6 +44,7 @@ You can also specify a service tag for peer discovery (default is "fastreg"):
 - Service-based node grouping
 - Distributed key-value storage and retrieval
 - Mesh network formation independent of bootstrap nodes
+- Docker registry mirror with P2P content distribution
 
 ## Example Usage
 
@@ -74,3 +75,28 @@ value, err := node.GetValue(ctx, "/fastreg/mykey")
 ```
 
 Values stored in the DHT are replicated across multiple nodes for redundancy and can be retrieved from any node in the network, even if the original node that stored the value is offline.
+
+## Registry Mirror
+
+FastReg includes a Docker registry mirror that leverages the DHT for peer-to-peer content distribution:
+
+```bash
+# Start a node with registry mirror enabled
+./fastreg -enable-registry -registry-addr 127.0.0.1:5000 -storage-dir /tmp/registry-data
+
+# Configure Docker to use the mirror
+# In your Docker daemon configuration (usually /etc/docker/daemon.json):
+{
+  "registry-mirrors": ["http://127.0.0.1:5000"]
+}
+```
+
+The registry mirror works as follows:
+
+1. When a container image is requested, the mirror first checks its local storage
+2. If not found locally, it queries the DHT to find peers who have the content
+3. If peers with the content are found, the blob is fetched directly from them
+4. Only as a last resort does it fall back to the upstream registry
+5. After retrieving content, it's stored locally and advertised in the DHT
+
+This approach significantly reduces bandwidth usage when multiple nodes need the same container images, as content is shared directly between peers in the network.

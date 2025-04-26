@@ -15,6 +15,10 @@ func run(ctx context.Context) error {
 	listenAddrs := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "Comma separated list of multiaddresses to listen on")
 	bootstrapAddrs := flag.String("bootstrap", "", "Comma separated list of bootstrap peer multiaddresses")
 	serviceTag := flag.String("service", "fastreg", "Service identifier tag for peer discovery")
+	registryAddr := flag.String("registry-addr", "0.0.0.0:5000", "Address to run the registry on")
+	storageDir := flag.String("storage-dir", "/tmp/registry", "Directory to store registry data")
+	upstreamURL := flag.String("upstream-url", "https://registry-1.docker.io", "Upstream registry URL")
+	enableRegistry := flag.Bool("enable-registry", false, "Enable the registry mirror")
 	flag.Parse()
 
 	// Split the listen addresses
@@ -43,6 +47,29 @@ func run(ctx context.Context) error {
 
 	// Start advertising and discovering peers
 	dht.AdvertiseAndFindPeers(ctx, *serviceTag)
+	
+	// Start registry if enabled
+	if *enableRegistry {
+		fmt.Printf("Initializing registry mirror at %s with storage in %s\n", *registryAddr, *storageDir)
+		fmt.Printf("Using upstream registry: %s\n", *upstreamURL)
+		
+		// Initialize the registry
+		registry, err := NewRegistry(ctx, dht, *storageDir, *upstreamURL)
+		if err != nil {
+			return fmt.Errorf("failed to initialize registry: %w", err)
+		}
+		
+		// Start the registry server in a goroutine
+		go func() {
+			fmt.Printf("Starting registry server on %s\n", *registryAddr)
+			if err := registry.StartRegistry(*registryAddr); err != nil {
+				fmt.Printf("Registry server error: %v\n", err)
+			}
+		}()
+		
+		fmt.Printf("Registry mirror is running. Configure Docker with:\n")
+		fmt.Printf("  docker daemon --registry-mirror=http://%s\n", *registryAddr)
+	}
 
 	// Main loop
 	fmt.Println("Application running. Press Ctrl+C to exit.")
