@@ -21,9 +21,14 @@ type Registry struct {
 	upstreamURL     string
 	storageDir      string
 	cache           sync.Map // Cache for DHT lookups
+	leases          sync.Map // Active leases for content being pulled
 	cacheTTL        time.Duration
 	upstreamTimeout time.Duration
+	leaseTTL        time.Duration
+	maxActiveLeases int       // Max concurrent upstream requests allowed
+	activeLeases    int       // Current number of active upstream requests
 	mu              sync.RWMutex
+	leaseMu         sync.Mutex // Separate mutex for lease operations
 }
 
 // CacheEntry represents a cached entry for a registry blob
@@ -31,6 +36,30 @@ type CacheEntry struct {
 	Peers   []string     // Peers that have this content
 	Created time.Time    // When this entry was created
 	Digest  digest.Digest // The content digest
+}
+
+// LeaseStatus represents the status of a content lease
+type LeaseStatus int
+
+const (
+	// LeaseStatusPending means content is being fetched from upstream
+	LeaseStatusPending LeaseStatus = iota
+	// LeaseStatusComplete means content has been fetched and is available
+	LeaseStatusComplete
+	// LeaseStatusFailed means fetching from upstream failed
+	LeaseStatusFailed
+)
+
+// ContentLease represents a lease for fetching content from upstream
+type ContentLease struct {
+	Digest    digest.Digest // Content digest
+	Status    LeaseStatus   // Current status
+	Error     error         // Error if status is Failed
+	Creator   string        // ID of node that created the lease
+	Created   time.Time     // When the lease was created
+	Completed time.Time     // When the lease was completed (if it was)
+	mu        sync.Mutex    // Mutex to protect status changes
+	waiters   []chan bool   // Channels to notify waiters when lease completes
 }
 
 // NewRegistry creates a new registry mirror
@@ -52,6 +81,8 @@ func NewRegistry(ctx context.Context, dht *DHT, storageDir, upstreamURL string) 
 		storageDir:      storageDir,
 		cacheTTL:        30 * time.Minute,
 		upstreamTimeout: 60 * time.Second, // Increase timeout for Docker Hub
+		leaseTTL:        2 * time.Minute,  // Lease timeout duration
+		maxActiveLeases: 5,               // Allow up to 5 concurrent upstream requests
 	}, nil
 }
 
@@ -465,72 +496,161 @@ func (r *Registry) HandleBlob(w http.ResponseWriter, req *http.Request, repo str
 		}
 	}
 	
-	// Step 3: Fall back to upstream
-	upstreamBlob, err := r.FetchFromUpstream(ctx, repo, dgst)
-	if err == nil {
-		defer upstreamBlob.Close()
-		
-		// Create a temporary file to buffer the content
-		tmpFile, err := os.CreateTemp("", "blob-buffer-*.tmp")
-		if err != nil {
-			fmt.Printf("Failed to create temporary buffer file: %v\n", err)
-			// If we can't buffer, just stream directly
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Docker-Content-Digest", dgst.String())
-			io.Copy(w, upstreamBlob)
-			return
-		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
-		
-		// Copy to the temporary file first
-		if _, err := io.Copy(tmpFile, upstreamBlob); err != nil {
-			fmt.Printf("Failed to copy to temporary file: %v\n", err)
-			// If we can't buffer, just tell the client there was an error
-			http.Error(w, "Failed to process content", http.StatusInternalServerError)
-			return
-		}
-		
-		// Rewind the file for reading
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("Failed to rewind temporary file: %v\n", err)
-			http.Error(w, "Failed to process content", http.StatusInternalServerError)
-			return
-		}
-		
-		// Store locally for future
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("Failed to rewind temporary file for storage: %v\n", err)
-		} else {
-			// Store locally for future
-			if err := r.StoreBlobLocally(dgst, tmpFile); err != nil {
-				fmt.Printf("Failed to store blob locally: %v\n", err)
-			} else {
-				// Also store in DHT
-				go r.StoreInDHT(context.Background(), dgst)
-			}
-		}
-		
-		// Rewind again for client response
-		if _, err := tmpFile.Seek(0, 0); err != nil {
-			fmt.Printf("Failed to rewind temporary file for response: %v\n", err)
-			http.Error(w, "Failed to process content", http.StatusInternalServerError)
-			return
-		}
-		
-		// Write the blob content to the response
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Docker-Content-Digest", dgst.String())
-		io.Copy(w, tmpFile)
+	// Step 3: Try to get a lease to fetch from upstream
+	lease, shouldFetch, err := r.obtainLease(ctx, dgst)
+	
+	// If we got an error trying to obtain a lease, fall back to direct upstream
+	if err != nil {
+		fmt.Printf("Failed to obtain lease, falling back to direct upstream: %v\n", err)
+		r.fetchAndServeFromUpstream(ctx, w, repo, dgst)
 		return
 	}
 	
-	// Nothing worked, return not found
-	http.Error(w, fmt.Sprintf("blob %s not found", dgst.String()), http.StatusNotFound)
+	if shouldFetch {
+		// We have the lease, so we should fetch from upstream
+		fmt.Printf("Obtained lease to fetch %s from upstream\n", dgst.String())
+		
+		// Fetch from upstream, but make sure to complete the lease when done
+		var fetchErr error
+		defer func() {
+			if lease != nil {
+				// This will be called when the function returns, which happens after
+				// we've served the content or encountered an error
+				r.completeLease(lease, fetchErr == nil, fetchErr)
+			}
+		}()
+		
+		// Do the actual fetch and serving
+		fetchErr = r.fetchAndServeFromUpstream(ctx, w, repo, dgst)
+		return
+	} else {
+		// We didn't get the lease, so we should wait for it
+		fmt.Printf("Waiting for another node to fetch %s from upstream\n", dgst.String())
+		
+		// Wait for the lease to complete
+		err := r.waitForLease(ctx, lease)
+		if err != nil {
+			// The lease failed or timed out, fall back to direct upstream
+			fmt.Printf("Lease wait failed, falling back to direct upstream: %v\n", err)
+			r.fetchAndServeFromUpstream(ctx, w, repo, dgst)
+			return
+		}
+		
+		// The lease completed successfully, try to get the blob locally
+		localBlob, err := r.GetLocalBlob(dgst)
+		if err == nil {
+			// We have it locally now, serve it
+			defer localBlob.Close()
+			
+			// Write the blob content
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Docker-Content-Digest", dgst.String())
+			io.Copy(w, localBlob)
+			return
+		}
+		
+		// If we still don't have it locally, try to find it in the DHT again
+		// This could happen if the node that fetched it is different from us
+		peers, err := r.FindInDHT(ctx, dgst)
+		if err == nil && len(peers) > 0 {
+			// Try to fetch from peers
+			for _, peer := range peers {
+				peerBlob, err := r.FetchFromPeer(ctx, dgst, peer)
+				if err == nil {
+					// Process and serve the peer blob
+					r.processAndServeBlob(w, peerBlob, dgst)
+					return
+				}
+			}
+		}
+		
+		// If we still don't have it, fall back to upstream as a last resort
+		fmt.Printf("Lease completed but content not available locally or via P2P, fetching from upstream\n")
+		r.fetchAndServeFromUpstream(ctx, w, repo, dgst)
+		return
+	}
+}
+
+// fetchAndServeFromUpstream fetches a blob from upstream and serves it
+func (r *Registry) fetchAndServeFromUpstream(ctx context.Context, w http.ResponseWriter, repo string, dgst digest.Digest) error {
+	// Fetch from upstream
+	upstreamBlob, err := r.FetchFromUpstream(ctx, repo, dgst)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to fetch from upstream: %v", err), http.StatusInternalServerError)
+		return err
+	}
+	defer upstreamBlob.Close()
+	
+	// Process and serve the blob
+	return r.processAndServeBlob(w, upstreamBlob, dgst)
+}
+
+// processAndServeBlob processes a blob from a reader and serves it to the client
+func (r *Registry) processAndServeBlob(w http.ResponseWriter, blob io.ReadCloser, dgst digest.Digest) error {
+	// Create a temporary file to buffer the content
+	tmpFile, err := os.CreateTemp("", "blob-buffer-*.tmp")
+	if err != nil {
+		fmt.Printf("Failed to create temporary buffer file: %v\n", err)
+		// If we can't buffer, just stream directly
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Docker-Content-Digest", dgst.String())
+		_, err = io.Copy(w, blob)
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+	
+	// Copy to the temporary file first
+	if _, err := io.Copy(tmpFile, blob); err != nil {
+		fmt.Printf("Failed to copy to temporary file: %v\n", err)
+		// If we can't buffer, just tell the client there was an error
+		http.Error(w, "Failed to process content", http.StatusInternalServerError)
+		return err
+	}
+	
+	// Rewind the file for reading
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		fmt.Printf("Failed to rewind temporary file: %v\n", err)
+		http.Error(w, "Failed to process content", http.StatusInternalServerError)
+		return err
+	}
+	
+	// Store locally for future
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		fmt.Printf("Failed to rewind temporary file for storage: %v\n", err)
+	} else {
+		// Store locally for future
+		if err := r.StoreBlobLocally(dgst, tmpFile); err != nil {
+			fmt.Printf("Failed to store blob locally: %v\n", err)
+		} else {
+			// Also store in DHT
+			go r.StoreInDHT(context.Background(), dgst)
+		}
+	}
+	
+	// Rewind again for client response
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		fmt.Printf("Failed to rewind temporary file for response: %v\n", err)
+		http.Error(w, "Failed to process content", http.StatusInternalServerError)
+		return err
+	}
+	
+	// Write the blob content to the response
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Docker-Content-Digest", dgst.String())
+	_, err = io.Copy(w, tmpFile)
+	return err
 }
 
 // StartRegistry starts the HTTP server for the registry
 func (r *Registry) StartRegistry(addr string) error {
+	// Create a background context for the lease cleanup routine
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Cancel when the server stops
+	
+	// Start the lease cleanup routine
+	r.startLeaseCleanupRoutine(ctx)
+	
 	// Create a mux for the server
 	mux := http.NewServeMux()
 	

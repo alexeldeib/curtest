@@ -96,7 +96,23 @@ The registry mirror works as follows:
 1. When a container image is requested, the mirror first checks its local storage
 2. If not found locally, it queries the DHT to find peers who have the content
 3. If peers with the content are found, the blob is fetched directly from them
-4. Only as a last resort does it fall back to the upstream registry
+4. If not available through P2P, a lease system coordinates upstream requests:
+   - Only one node (or a small set of nodes) will fetch the same content from upstream 
+   - Other nodes requesting the same content will wait for it to become available
+   - Once the content is fetched, it's shared with all waiting nodes via P2P
 5. After retrieving content, it's stored locally and advertised in the DHT
 
-This approach significantly reduces bandwidth usage when multiple nodes need the same container images, as content is shared directly between peers in the network.
+This approach significantly reduces bandwidth usage and upstream load in two ways:
+- Content is shared directly between peers in the network
+- The lease mechanism prevents flooding the upstream registry when many nodes request the same content simultaneously
+
+### Lease Mechanism
+
+The lease system ensures efficient content distribution when many nodes need the same content:
+
+- When multiple nodes request the same blob simultaneously, they coordinate through leases
+- Only a configurable number of nodes (default: 5) will pull from upstream at the same time
+- Other nodes wait for the content to become available via P2P
+- If a node holding a lease fails, the lease expires and another node takes over
+- This prevents unnecessary duplicate upstream requests while ensuring content availability
+- Each node maintains its own lease state, making the system fully distributed with no central authority
