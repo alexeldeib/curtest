@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-kad-dht"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -33,16 +33,24 @@ func NewDHT(ctx context.Context, listenAddrs []string) (*DHT, error) {
 		maddrs = append(maddrs, ma)
 	}
 
-	// Create a libp2p host
+	// Create a libp2p host with options that help with discovery
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(maddrs...),
+		// Enable Hole punching for NAT traversal
+		libp2p.EnableHolePunching(),
+		// Enable NAT service
+		libp2p.EnableNATService(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	// Create a DHT, for peer discovery
-	kadDHT, err := dht.New(ctx, h)
+	// Create a DHT in server mode for better discovery
+	// Based on the reference test, server mode is important for full DHT participation
+	kadDHT, err := dht.New(ctx, h, 
+		dht.Mode(dht.ModeServer),
+		dht.ProtocolPrefix("/fastreg"), // Use a custom protocol prefix for our app
+	)
 	if err != nil {
 		h.Close()
 		return nil, fmt.Errorf("failed to create DHT: %w", err)
@@ -95,6 +103,16 @@ func (d *DHT) AdvertiseAndFindPeers(ctx context.Context, serviceTag string) {
 
 	// Look for others that have announced the same service
 	go func() {
+		// Shorter interval for tests and initial discovery
+		initialInterval := 1 * time.Second
+		// Longer interval for ongoing discovery
+		regularInterval := time.Minute
+		
+		// Use shorter interval for first few attempts
+		currentInterval := initialInterval
+		attemptCount := 0
+		maxInitialAttempts := 5
+		
 		for {
 			peerChan, err := routingDiscovery.FindPeers(ctx, serviceTag)
 			if err != nil {
@@ -102,22 +120,51 @@ func (d *DHT) AdvertiseAndFindPeers(ctx context.Context, serviceTag string) {
 				return
 			}
 
+			foundPeers := 0
 			for peer := range peerChan {
 				if peer.ID == d.host.ID() {
 					continue // Skip ourselves
 				}
-				if err := d.host.Connect(ctx, peer); err != nil {
-					fmt.Printf("Failed to connect to peer %s: %s\n", peer.ID, err)
-					continue
+				
+				// Only try to connect if we're not already connected
+				if d.host.Network().Connectedness(peer.ID) != 2 { // 2 = Connected
+					if err := d.host.Connect(ctx, peer); err != nil {
+						fmt.Printf("Failed to connect to peer %s: %s\n", peer.ID, err)
+						continue
+					}
+					fmt.Printf("Connected to peer: %s\n", peer.ID)
+					foundPeers++
 				}
-				fmt.Printf("Connected to peer: %s\n", peer.ID)
+			}
+			
+			// For testing - if we find peers, actively try to get them to discover each other
+			if foundPeers > 0 {
+				// Ping the DHT to help discovery
+				if err := d.kadDHT.Bootstrap(ctx); err != nil {
+					fmt.Printf("Error bootstrapping DHT: %s\n", err)
+				}
+				
+				// Get some random peers from our table and connect them to each other
+				// This should accelerate the mesh network formation
+				for _, p := range d.host.Peerstore().Peers() {
+					if p == d.host.ID() {
+						continue
+					}
+					d.kadDHT.FindPeer(ctx, p)
+				}
+			}
+			
+			// Adjust timer interval based on discovery phase
+			attemptCount++
+			if attemptCount > maxInitialAttempts {
+				currentInterval = regularInterval
 			}
 
-			// Wait a bit before searching again
+			// Wait before searching again
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Minute):
+			case <-time.After(currentInterval):
 				continue
 			}
 		}
@@ -129,12 +176,12 @@ func (d *DHT) GetHostAddresses() []string {
 	addrs := d.host.Addrs()
 	hostID := d.host.ID()
 	var fullAddrs []string
-	
+
 	for _, addr := range addrs {
 		fullAddr := fmt.Sprintf("%s/p2p/%s", addr.String(), hostID.String())
 		fullAddrs = append(fullAddrs, fullAddr)
 	}
-	
+
 	return fullAddrs
 }
 
@@ -142,17 +189,17 @@ func (d *DHT) GetHostAddresses() []string {
 func (d *DHT) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	
+
 	var err error
 	if err1 := d.kadDHT.Close(); err1 != nil {
 		err = err1
 	}
-	
+
 	if err2 := d.host.Close(); err2 != nil {
 		if err == nil {
 			err = err2
 		}
 	}
-	
+
 	return err
 }
