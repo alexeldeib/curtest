@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,7 +51,7 @@ func NewRegistry(ctx context.Context, dht *DHT, storageDir, upstreamURL string) 
 		upstreamURL:     upstreamURL,
 		storageDir:      storageDir,
 		cacheTTL:        30 * time.Minute,
-		upstreamTimeout: 30 * time.Second,
+		upstreamTimeout: 60 * time.Second, // Increase timeout for Docker Hub
 	}, nil
 }
 
@@ -120,54 +121,224 @@ func (r *Registry) FindInDHT(ctx context.Context, dgst digest.Digest) ([]string,
 
 // FetchFromPeer attempts to fetch a blob from a peer
 func (r *Registry) FetchFromPeer(ctx context.Context, dgst digest.Digest, peerAddr string) (io.ReadCloser, error) {
-	// Create a direct HTTP request to the peer
-	url := fmt.Sprintf("http://%s/v2/blobs/%s", peerAddr, dgst.String())
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	// Extract the IP address and port from the multiaddress
+	// Format is typically like /ip4/127.0.0.1/tcp/9501/p2p/12D3KooWA8MswTVHRNt584LzT3Zr6eFw6xnfSiTw7ae3eUJxYNCM
+	parts := strings.Split(peerAddr, "/")
+	
+	// We need at least 6 parts: ["", "ip4", "127.0.0.1", "tcp", "9501", "p2p", ...]
+	if len(parts) < 6 {
+		return nil, fmt.Errorf("invalid peer address format: %s", peerAddr)
+	}
+	
+	// Get the IP address and port
+	// Skip protocol parts - just extract the address and port
+	ipAddr := parts[2]   // e.g., "127.0.0.1"
+	port := parts[4]     // e.g., "9501"
+	
+	// Create a proper HTTP URL 
+	url := fmt.Sprintf("http://%s:%s/v2/blobs/%s", ipAddr, port, dgst.String())
+	
+	// Create an HTTP request with timeout
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if err != nil {
+		reqCancel()
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	// Send the request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		reqCancel()
 		return nil, fmt.Errorf("failed to fetch from peer: %w", err)
 	}
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
+		reqCancel()
 		return nil, fmt.Errorf("peer returned status %d", resp.StatusCode)
 	}
 
-	return resp.Body, nil
+	// Return body with context cancellation
+	return &cancelReadCloser{
+		ReadCloser: resp.Body,
+		cancel:     reqCancel,
+	}, nil
 }
 
 // FetchFromUpstream attempts to fetch a blob from the upstream registry
 func (r *Registry) FetchFromUpstream(ctx context.Context, repo string, dgst digest.Digest) (io.ReadCloser, error) {
-	// Create a timeout context
-	ctxTimeout, cancel := context.WithTimeout(ctx, r.upstreamTimeout)
-	defer cancel()
+	// Create a new independent context with timeout to avoid cancellation issues from parent
+	// This allows the HTTP request to complete even if the parent context is cancelled
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), r.upstreamTimeout)
 	
 	// Create a direct HTTP request to the upstream
 	url := fmt.Sprintf("%s/v2/%s/blobs/%s", r.upstreamURL, repo, dgst.String())
-	req, err := http.NewRequestWithContext(ctxTimeout, "GET", url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if err != nil {
+		reqCancel()
 		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	// Add Docker Hub specific headers if needed
+	if strings.Contains(r.upstreamURL, "docker.io") {
+		req.Header.Set("User-Agent", "fastreg/1.0")
 	}
 
 	// Send the request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		reqCancel()
 		return nil, fmt.Errorf("failed to fetch from upstream: %w", err)
+	}
+	
+	// Handle auth challenges
+	if resp.StatusCode == http.StatusUnauthorized {
+		// For Docker Hub, we need to get a token first
+		authHeader := resp.Header.Get("Www-Authenticate")
+		if authHeader != "" && strings.Contains(authHeader, "Bearer") {
+			// Close the first response
+			resp.Body.Close()
+			
+			// Extract the auth parameters
+			authParams := extractAuthParams(authHeader)
+			
+			// Get a token - use the independent context for token request too
+			token, err := getDockerHubToken(reqCtx, authParams, repo)
+			if err != nil {
+				reqCancel()
+				return nil, fmt.Errorf("failed to get auth token: %w", err)
+			}
+			
+			// Create a new request with the token
+			req, err = http.NewRequestWithContext(reqCtx, "GET", url, nil)
+			if err != nil {
+				reqCancel()
+				return nil, fmt.Errorf("failed to create authorized request: %w", err)
+			}
+			
+			// Add the authorization header
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+			if strings.Contains(r.upstreamURL, "docker.io") {
+				req.Header.Set("User-Agent", "fastreg/1.0")
+			}
+			
+			// Try again with the token
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				reqCancel()
+				return nil, fmt.Errorf("failed to fetch from upstream with token: %w", err)
+			}
+		}
 	}
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+		reqCancel()
+		return nil, fmt.Errorf("upstream returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	return resp.Body, nil
+	// Create a ReadCloser that will cancel the context when closed
+	return &cancelReadCloser{
+		ReadCloser: resp.Body,
+		cancel:     reqCancel,
+	}, nil
+}
+
+// cancelReadCloser wraps a ReadCloser and cancels a context when closed
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close closes the wrapped ReadCloser and cancels the context
+func (c *cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// Extract auth parameters from WWW-Authenticate header
+func extractAuthParams(header string) map[string]string {
+	params := make(map[string]string)
+	
+	// Extract the scheme and parameters
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return params
+	}
+	
+	// Parse the parameters
+	for _, param := range strings.Split(parts[1], ",") {
+		keyValue := strings.SplitN(param, "=", 2)
+		if len(keyValue) != 2 {
+			continue
+		}
+		
+		key := strings.TrimSpace(keyValue[0])
+		value := strings.Trim(strings.TrimSpace(keyValue[1]), "\"")
+		params[key] = value
+	}
+	
+	return params
+}
+
+// Get a Docker Hub token for a repository
+func getDockerHubToken(ctx context.Context, authParams map[string]string, repo string) (string, error) {
+	realm := authParams["realm"]
+	service := authParams["service"]
+	scope := authParams["scope"]
+	
+	if realm == "" || service == "" {
+		return "", fmt.Errorf("missing required auth parameters")
+	}
+	
+	// Create the token request URL
+	tokenURL := fmt.Sprintf("%s?service=%s", realm, service)
+	if scope != "" {
+		tokenURL = fmt.Sprintf("%s&scope=%s", tokenURL, scope)
+	}
+	
+	// Add a client with a reasonable timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	// Make the request, using provided context
+	req, err := http.NewRequestWithContext(ctx, "GET", tokenURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create token request: %w", err)
+	}
+	
+	// Add user agent for Docker Hub
+	req.Header.Set("User-Agent", "fastreg/1.0")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get token: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("token request returned status %d: %s", resp.StatusCode, string(body))
+	}
+	
+	// Parse the response
+	var tokenResp struct {
+		Token string `json:"token"`
+	}
+	
+	err = json.NewDecoder(resp.Body).Decode(&tokenResp)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse token response: %w", err)
+	}
+	
+	return tokenResp.Token, nil
 }
 
 // StoreBlobLocally stores a blob in the local filesystem
