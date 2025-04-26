@@ -17,18 +17,19 @@ import (
 
 // Registry represents our mirror registry with DHT-based content lookup
 type Registry struct {
-	dht             *DHT
-	upstreamURL     string
-	storageDir      string
-	cache           sync.Map // Cache for DHT lookups
-	leases          sync.Map // Active leases for content being pulled
-	cacheTTL        time.Duration
-	upstreamTimeout time.Duration
-	leaseTTL        time.Duration
-	maxActiveLeases int       // Max concurrent upstream requests allowed
-	activeLeases    int       // Current number of active upstream requests
-	mu              sync.RWMutex
-	leaseMu         sync.Mutex // Separate mutex for lease operations
+	dht              *DHT
+	upstreamURL      string
+	storageDir       string
+	cache            sync.Map // Cache for DHT lookups
+	leases           sync.Map // Active leases for content being pulled
+	cacheTTL         time.Duration
+	upstreamTimeout  time.Duration
+	leaseTTL         time.Duration
+	maxActiveLeases  int       // Max concurrent upstream requests allowed
+	activeLeases     int       // Current number of active upstream requests
+	mu               sync.RWMutex
+	leaseMu          sync.Mutex // Separate mutex for lease operations
+	useDHTForLeases  bool       // Flag to control whether to use DHT for lease coordination
 }
 
 // CacheEntry represents a cached entry for a registry blob
@@ -62,6 +63,15 @@ type ContentLease struct {
 	waiters   []chan bool   // Channels to notify waiters when lease completes
 }
 
+// DHTLease represents a serializable lease for DHT storage
+type DHTLease struct {
+	Digest    string    `json:"digest"`
+	Status    int       `json:"status"`
+	Creator   string    `json:"creator"`
+	Created   time.Time `json:"created"`
+	Completed time.Time `json:"completed,omitempty"`
+}
+
 // NewRegistry creates a new registry mirror
 func NewRegistry(ctx context.Context, dht *DHT, storageDir, upstreamURL string) (*Registry, error) {
 	// Ensure the storage directory exists
@@ -83,6 +93,7 @@ func NewRegistry(ctx context.Context, dht *DHT, storageDir, upstreamURL string) 
 		upstreamTimeout: 60 * time.Second, // Increase timeout for Docker Hub
 		leaseTTL:        2 * time.Minute,  // Lease timeout duration
 		maxActiveLeases: 5,               // Allow up to 5 concurrent upstream requests
+		useDHTForLeases: true,            // By default, use DHT for lease coordination
 	}, nil
 }
 
@@ -508,7 +519,11 @@ func (r *Registry) HandleBlob(w http.ResponseWriter, req *http.Request, repo str
 	
 	if shouldFetch {
 		// We have the lease, so we should fetch from upstream
-		fmt.Printf("Obtained lease to fetch %s from upstream\n", dgst.String())
+		nodeID := "unknown"
+		if r.dht != nil && r.dht.host != nil {
+			nodeID = r.dht.host.ID().String()
+		}
+		fmt.Printf("Node %s obtained lease to fetch %s from upstream\n", nodeID, dgst.String())
 		
 		// Fetch from upstream, but make sure to complete the lease when done
 		var fetchErr error
@@ -516,6 +531,12 @@ func (r *Registry) HandleBlob(w http.ResponseWriter, req *http.Request, repo str
 			if lease != nil {
 				// This will be called when the function returns, which happens after
 				// we've served the content or encountered an error
+				status := "success"
+				if fetchErr != nil {
+					status = "failure"
+				}
+				fmt.Printf("Node %s completing lease for %s with status %s\n", 
+					nodeID, dgst.String(), status)
 				r.completeLease(lease, fetchErr == nil, fetchErr)
 			}
 		}()
@@ -525,16 +546,25 @@ func (r *Registry) HandleBlob(w http.ResponseWriter, req *http.Request, repo str
 		return
 	} else {
 		// We didn't get the lease, so we should wait for it
-		fmt.Printf("Waiting for another node to fetch %s from upstream\n", dgst.String())
+		nodeID := "unknown"
+		if r.dht != nil && r.dht.host != nil {
+			nodeID = r.dht.host.ID().String()
+		}
+		creatorID := lease.Creator
+		fmt.Printf("Node %s waiting for node %s to fetch %s from upstream\n", 
+			nodeID, creatorID, dgst.String())
 		
 		// Wait for the lease to complete
 		err := r.waitForLease(ctx, lease)
 		if err != nil {
 			// The lease failed or timed out, fall back to direct upstream
-			fmt.Printf("Lease wait failed, falling back to direct upstream: %v\n", err)
+			fmt.Printf("Node %s: lease wait failed, falling back to direct upstream: %v\n", 
+				nodeID, err)
 			r.fetchAndServeFromUpstream(ctx, w, repo, dgst)
 			return
 		}
+		fmt.Printf("Node %s: lease completed by node %s for %s\n", 
+			nodeID, creatorID, dgst.String())
 		
 		// The lease completed successfully, try to get the blob locally
 		localBlob, err := r.GetLocalBlob(dgst)
