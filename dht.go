@@ -14,6 +14,19 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+// FastRegValidator is a simple validator for our DHT records
+type FastRegValidator struct{}
+
+// Validate validates a record
+func (v FastRegValidator) Validate(key string, value []byte) error {
+	return nil // Accept all records for simplicity
+}
+
+// Select selects the best record
+func (v FastRegValidator) Select(key string, values [][]byte) (int, error) {
+	return 0, nil // Select the first record for simplicity
+}
+
 // DHT represents our Kademlia DHT service
 type DHT struct {
 	host   host.Host
@@ -45,11 +58,15 @@ func NewDHT(ctx context.Context, listenAddrs []string) (*DHT, error) {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
+	// Set namespaced validator to ensure we can store our values
+	validatorOpt := dht.NamespacedValidator("fastreg", FastRegValidator{})
+	
 	// Create a DHT in server mode for better discovery
 	// Based on the reference test, server mode is important for full DHT participation
 	kadDHT, err := dht.New(ctx, h, 
 		dht.Mode(dht.ModeServer),
 		dht.ProtocolPrefix("/fastreg"), // Use a custom protocol prefix for our app
+		validatorOpt, // Use our validator
 	)
 	if err != nil {
 		h.Close()
@@ -183,6 +200,22 @@ func (d *DHT) GetHostAddresses() []string {
 	}
 
 	return fullAddrs
+}
+
+// PutValue puts a value in the DHT
+func (d *DHT) PutValue(ctx context.Context, key string, value []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	return d.kadDHT.PutValue(ctx, key, value)
+}
+
+// GetValue retrieves a value from the DHT
+func (d *DHT) GetValue(ctx context.Context, key string) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	return d.kadDHT.GetValue(ctx, key)
 }
 
 // Close shuts down the DHT and host

@@ -261,6 +261,30 @@ func TestDHTNetworkFormation(t *testing.T) {
 		t.Logf("Bootstrap node successfully tracks all %d peers", len(bootstrapPeers))
 	}
 	
+	// Test DHT value storage and retrieval
+	t.Log("Testing DHT distributed key-value storage...")
+	testKey := "/fastreg/test/key1" // Use our custom namespace for the key
+	testValue := []byte("Hello DHT World!")
+	
+	// Store value from node 1
+	err = nodes[1].PutValue(ctx, testKey, testValue)
+	if err != nil {
+		t.Errorf("Failed to put value in DHT: %v", err)
+	} else {
+		t.Log("Successfully stored value in DHT from node 1")
+	}
+	
+	// Try to retrieve the value from node 2 (should be able to find it via DHT)
+	time.Sleep(2 * time.Second) // Give time for the value to propagate
+	retrievedValue, err := nodes[2].GetValue(ctx, testKey)
+	if err != nil {
+		t.Errorf("Failed to get value from DHT: %v", err)
+	} else if string(retrievedValue) != string(testValue) {
+		t.Errorf("Retrieved incorrect value. Got %q, expected %q", string(retrievedValue), string(testValue))
+	} else {
+		t.Logf("Successfully retrieved value from DHT via node 2: %q", string(retrievedValue))
+	}
+	
 	// Try to disconnect bootstrap node from one of the other nodes
 	if numNodes >= 3 {
 		// Disconnect node 2 from bootstrap node
