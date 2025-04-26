@@ -19,6 +19,12 @@ func run(ctx context.Context) error {
 	storageDir := flag.String("storage-dir", "/tmp/registry", "Directory to store registry data")
 	upstreamURL := flag.String("upstream-url", "https://registry-1.docker.io", "Upstream registry URL")
 	enableRegistry := flag.Bool("enable-registry", false, "Enable the registry mirror")
+	
+	// RDMA-related flags
+	rdmaEnabled := flag.Bool("rdma-enabled", false, "Enable RDMA transport for content distribution")
+	rdmaListenAddr := flag.String("rdma-listen-addr", "0.0.0.0", "RDMA listen address")
+	rdmaListenPort := flag.Int("rdma-listen-port", 9999, "RDMA listen port")
+	
 	flag.Parse()
 
 	// Split the listen addresses
@@ -57,6 +63,25 @@ func run(ctx context.Context) error {
 		registry, err := NewRegistry(ctx, dht, *storageDir, *upstreamURL)
 		if err != nil {
 			return fmt.Errorf("failed to initialize registry: %w", err)
+		}
+		
+		// Initialize RDMA transport if enabled
+		if *rdmaEnabled {
+			if IsRDMAAvailable() {
+				fmt.Printf("RDMA is available, initializing RDMA transport on %s:%d\n", 
+					*rdmaListenAddr, *rdmaListenPort)
+				
+				err := RegisterRDMATransport(ctx, registry, *rdmaListenAddr, *rdmaListenPort)
+				if err != nil {
+					fmt.Printf("Warning: Failed to initialize RDMA transport: %v\n", err)
+					fmt.Printf("Continuing without RDMA support\n")
+				} else {
+					fmt.Printf("RDMA transport initialized successfully\n")
+				}
+			} else {
+				fmt.Printf("Warning: RDMA was requested but is not available on this system\n")
+				fmt.Printf("Continuing without RDMA support\n")
+			}
 		}
 		
 		// Start the registry server in a goroutine

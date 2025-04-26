@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  fastreg-rdma-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.rdma
+    image: fastreg-rdma:latest
+    container_name: fastreg-rdma-1
+    hostname: fastreg-rdma-1
+    command: ["--rdma-enabled", "--rdma-listen-port=9901", "--storage-dir=/data", "--upstream-url=https://registry-1.docker.io"]
+    ports:
+      - "8901:8080"
+      - "9901:9901"
+    volumes:
+      - fastreg-rdma-1-data:/data
+      - /dev/infiniband:/dev/infiniband  # Mount RDMA devices
+    cap_add:
+      - IPC_LOCK  # Required for RDMA operations
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    privileged: true  # Only needed if running in a non-bare-metal environment
+    networks:
+      fastreg-rdma-net:
+        ipv4_address: 172.28.0.2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: infiniband  # Specify device driver
+              count: all  # Request all available devices
+              capabilities: [rdma]  # Only request RDMA capability
+
+  fastreg-rdma-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.rdma
+    image: fastreg-rdma:latest
+    container_name: fastreg-rdma-2
+    hostname: fastreg-rdma-2
+    command: ["--rdma-enabled", "--rdma-listen-port=9902", "--storage-dir=/data", "--upstream-url=https://registry-1.docker.io"]
+    ports:
+      - "8902:8080"
+      - "9902:9902"
+    volumes:
+      - fastreg-rdma-2-data:/data
+      - /dev/infiniband:/dev/infiniband  # Mount RDMA devices
+    cap_add:
+      - IPC_LOCK  # Required for RDMA operations
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    privileged: true  # Only needed if running in a non-bare-metal environment
+    networks:
+      fastreg-rdma-net:
+        ipv4_address: 172.28.0.3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: infiniband
+              count: all
+              capabilities: [rdma]
+
+  fastreg-rdma-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.rdma
+    image: fastreg-rdma:latest
+    container_name: fastreg-rdma-3
+    hostname: fastreg-rdma-3
+    command: ["--rdma-enabled", "--rdma-listen-port=9903", "--storage-dir=/data", "--upstream-url=https://registry-1.docker.io"]
+    ports:
+      - "8903:8080"
+      - "9903:9903"
+    volumes:
+      - fastreg-rdma-3-data:/data
+      - /dev/infiniband:/dev/infiniband  # Mount RDMA devices
+    cap_add:
+      - IPC_LOCK  # Required for RDMA operations
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    privileged: true  # Only needed if running in a non-bare-metal environment
+    networks:
+      fastreg-rdma-net:
+        ipv4_address: 172.28.0.4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: infiniband
+              count: all
+              capabilities: [rdma]
+
+networks:
+  fastreg-rdma-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  fastreg-rdma-1-data:
+  fastreg-rdma-2-data:
+  fastreg-rdma-3-data:

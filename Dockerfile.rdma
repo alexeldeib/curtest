@@ -1,0 +1,63 @@
+FROM golang:1.21-bullseye as builder
+
+# Install RDMA development libraries
+RUN apt-get update && apt-get install -y \
+    libibverbs-dev \
+    librdmacm-dev \
+    ibverbs-utils \
+    rdma-core \
+    perftest \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy Go module files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY *.go ./
+
+# Build with RDMA support
+RUN CGO_ENABLED=1 go build -o fastreg
+
+# Create runtime image with RDMA support
+FROM debian:bullseye-slim
+
+# Install RDMA runtime libraries and utilities
+RUN apt-get update && apt-get install -y \
+    libibverbs1 \
+    librdmacm1 \
+    ibverbs-utils \
+    rdma-core \
+    iproute2 \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /build/fastreg /app/
+
+# Create directories for blob storage
+RUN mkdir -p /data/blobs
+
+# Set environment variables
+ENV STORAGE_DIR=/data
+ENV RDMA_ENABLED=true
+ENV RDMA_LISTEN_ADDR=0.0.0.0
+ENV RDMA_LISTEN_PORT=9999
+
+# Expose ports
+EXPOSE 8080/tcp  # HTTP API
+EXPOSE 9999/tcp  # RDMA
+
+# Container needs to run with --cap-add=IPC_LOCK
+# and also needs to have access to the RDMA devices via
+# --device=/dev/infiniband -v /dev/infiniband:/dev/infiniband
+
+# Run with RDMA support
+ENTRYPOINT ["/app/fastreg"]
+CMD ["--rdma-enabled", "--storage-dir=/data"]
